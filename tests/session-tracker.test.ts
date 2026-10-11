@@ -1,13 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createSessionTracker } from "../src/session-tracker.ts";
+import { CacheOptimizerRouting, PI_ROUTING_REGISTRY_SYMBOL, hashSessionId } from "../src/cache-optimizer-routing.ts";
 
 const registry = { getAvailable: () => [{ provider: "my-provider", id: "vendor-a/model-1" }] };
 
-// A fake pi ExtensionContext. Like pi, it throws after its session ends.
-function fakeContext(id: string) {
+// A fake pi session. Like pi, it gives a new context object for each event,
+// and all its contexts throw after the session is invalidated.
+function fakeSession(id: string) {
   let stale = false;
-  const ctx = {
+  const ctx = () => ({
     get sessionManager() {
       if (stale) throw new Error("This extension ctx is stale");
       return { getSessionId: () => id };
@@ -16,43 +18,65 @@ function fakeContext(id: string) {
       if (stale) throw new Error("This extension ctx is stale");
       return registry;
     },
-  };
+  });
   return { ctx, invalidate: () => { stale = true; } };
+}
+
+// The tracker and the shutdown hook as index.ts wires them.
+function harness() {
+  const globals: Record<symbol, unknown> = {};
+  const routing = new CacheOptimizerRouting("auto-router", () => []);
+  routing.register(globals);
+  const ended: string[] = [];
+  const sessions = createSessionTracker((id) => {
+    ended.push(id);
+    routing.clearSession(id);
+  });
+  const shutdown = (ctx: any) => {
+    sessions.end(ctx);
+    if (!sessions.hasLiveSessions()) routing.unregisterAdapter();
+  };
+  const adapter = () => (globals[PI_ROUTING_REGISTRY_SYMBOL] as any).getRouter("auto-router");
+  const publish = (sessionId: string) =>
+    routing.publish("swe", { provider: "p", modelId: "m", label: "p" }, "success", { sessionId, requestId: "r" });
+  const snapshot = (sessionId: string) =>
+    adapter()?.resolveActiveRoute("swe", { sessionIdHash: hashSessionId(sessionId), requestId: "r" });
+  return { sessions, shutdown, adapter, publish, snapshot, ended, routing };
 }
 
 describe("session-tracker", () => {
   it("keeps the main session current when a subagent session ends", () => {
     const sessions = createSessionTracker();
-    const main = fakeContext("main");
-    const child = fakeContext("child");
-    sessions.update(main.ctx);
-    sessions.update(child.ctx);
+    const main = fakeSession("main");
+    const child = fakeSession("child");
+    sessions.update(main.ctx());
+    sessions.update(child.ctx());
     assert.equal(sessions.sessionId(), "child");
 
-    assert.equal(sessions.end(child.ctx), "child");
+    sessions.end(child.ctx());
     child.invalidate();
 
     assert.equal(sessions.sessionId(), "main");
-    assert.equal(sessions.context(), main.ctx);
+    assert.equal(sessions.context().sessionManager.getSessionId(), "main");
     assert.equal(sessions.registry(), registry);
     assert.equal(sessions.hasLiveSessions(), true);
   });
 
   it("keeps the current session when a session that is not current ends", () => {
     const sessions = createSessionTracker();
-    const main = fakeContext("main");
-    const child = fakeContext("child");
-    sessions.update(child.ctx);
-    sessions.update(main.ctx);
-    sessions.end(child.ctx);
+    const main = fakeSession("main");
+    const child = fakeSession("child");
+    sessions.update(child.ctx());
+    sessions.update(main.ctx());
+    sessions.end(child.ctx());
     assert.equal(sessions.sessionId(), "main");
   });
 
   it("returns the last registry after every session ends", () => {
     const sessions = createSessionTracker();
-    const main = fakeContext("main");
-    sessions.update(main.ctx);
-    sessions.end(main.ctx);
+    const main = fakeSession("main");
+    sessions.update(main.ctx());
+    sessions.end(main.ctx());
     main.invalidate();
     assert.equal(sessions.hasLiveSessions(), false);
     assert.equal(sessions.context(), undefined);
@@ -62,21 +86,98 @@ describe("session-tracker", () => {
 
   it("returns the last registry when the current context is stale", () => {
     const sessions = createSessionTracker();
-    const child = fakeContext("child");
-    sessions.update(child.ctx);
+    const child = fakeSession("child");
+    sessions.update(child.ctx());
     // pi-subagents disposes a child even when its shutdown hooks time out.
     child.invalidate();
     assert.equal(sessions.registry(), registry);
   });
 
-  it("ignores a stale context", () => {
+  it("ignores a context that is stale before registration", () => {
     const sessions = createSessionTracker();
-    const main = fakeContext("main");
-    const stale = fakeContext("old");
-    stale.invalidate();
-    sessions.update(main.ctx);
-    sessions.update(stale.ctx);
-    assert.equal(sessions.end(stale.ctx), undefined);
+    const main = fakeSession("main");
+    const old = fakeSession("old");
+    old.invalidate();
+    sessions.update(main.ctx());
+    sessions.update(old.ctx());
+    sessions.end(old.ctx());
     assert.equal(sessions.sessionId(), "main");
+  });
+
+  it("removes a registered child that becomes stale before its shutdown", () => {
+    const h = harness();
+    const main = fakeSession("main");
+    const child = fakeSession("child");
+    h.sessions.update(main.ctx());
+    h.sessions.update(child.ctx());
+    h.publish("main");
+    h.publish("child");
+
+    child.invalidate();
+    assert.equal(h.sessions.registry(), registry);
+    h.shutdown(child.ctx());
+
+    assert.deepEqual(h.ended, ["child"]);
+    assert.equal(h.sessions.sessionId(), "main");
+    assert.equal(h.snapshot("child"), undefined);
+    assert.equal(h.snapshot("main")?.provider, "p");
+    assert.ok(h.adapter());
+
+    h.shutdown(main.ctx());
+    main.invalidate();
+    assert.equal(h.sessions.hasLiveSessions(), false);
+    assert.equal(h.sessions.sessionId(), undefined);
+    assert.equal(h.sessions.context(), undefined);
+    assert.equal(h.adapter(), undefined);
+  });
+
+  it("removes a child disposed without shutdown when the main session ends", () => {
+    const h = harness();
+    const main = fakeSession("main");
+    const child = fakeSession("child");
+    h.sessions.update(main.ctx());
+    h.sessions.update(child.ctx());
+    h.publish("main");
+    h.publish("child");
+
+    // No session_shutdown for the child.
+    child.invalidate();
+    // Keep the adapter object: unregister hides it from the registry.
+    const adapter = h.adapter();
+    h.shutdown(main.ctx());
+    main.invalidate();
+
+    assert.deepEqual(h.ended, ["main", "child"]);
+    assert.equal(h.sessions.hasLiveSessions(), false);
+    assert.equal(h.sessions.sessionId(), undefined);
+    assert.equal(h.sessions.context(), undefined);
+    const resolve = (id: string) =>
+      adapter.resolveActiveRoute("swe", { sessionIdHash: hashSessionId(id), requestId: "r" });
+    assert.equal(resolve("child"), undefined);
+    assert.equal(resolve("main"), undefined);
+    assert.equal(h.adapter(), undefined);
+  });
+
+  it("removes a stale session on end() with no read before it", () => {
+    const h = harness();
+    const main = fakeSession("main");
+    const child = fakeSession("child");
+    h.sessions.update(main.ctx());
+    h.sessions.update(child.ctx());
+    child.invalidate();
+    h.sessions.end(child.ctx());
+    assert.deepEqual(h.ended, ["child"]);
+    assert.equal(h.sessions.sessionId(), "main");
+  });
+
+  it("removes a child disposed without shutdown on the next read", () => {
+    const h = harness();
+    const main = fakeSession("main");
+    const child = fakeSession("child");
+    h.sessions.update(main.ctx());
+    h.sessions.update(child.ctx());
+    child.invalidate();
+    assert.equal(h.sessions.sessionId(), "main");
+    assert.deepEqual(h.ended, ["child"]);
   });
 });

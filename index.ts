@@ -118,7 +118,7 @@ const uviHardMode = (() => {
 
 let budgetReady = false;
 // The main session and in-process subagent sessions share this module.
-const sessions = createSessionTracker();
+const sessions = createSessionTracker((sessionId) => cacheOptimizerRouting.clearSession(sessionId));
 const conversationIds = new WeakMap<object, string>();
 const lastDecisionByConversation = new Map<string, { requestId: string; routeId: string; provider: string; modelId: string; timestamp: number }>();
 let recentCompletedDecisions: CompletedDecisionFeedbackContext[] = [];
@@ -2128,8 +2128,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     // A subagent session also sends this event. Remove only the state of the
     // session that ends. The context becomes stale after this hook returns.
-    const sessionId = sessions.end(ctx);
-    if (sessionId) cacheOptimizerRouting.clearSession(sessionId);
+    sessions.end(ctx);
     if (!sessions.hasLiveSessions()) cacheOptimizerRouting.unregisterAdapter();
   });
   pi.on("model_select", async (_event, ctx) => updateUi(ctx));

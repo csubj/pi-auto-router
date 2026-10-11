@@ -20,45 +20,64 @@ export function sessionIdOf(ctx: any): string | undefined {
   return read(() => ctx?.sessionManager?.getSessionId?.());
 }
 
-export function createSessionTracker() {
+/**
+ * onEnd receives the id of each session that ends. This includes a session
+ * whose context became stale without a session_shutdown event.
+ */
+export function createSessionTracker(onEnd: (sessionId: string) => void = () => {}) {
   // Insertion order is recency order: update() moves a session to the end.
   const live = new Map<string, any>();
-  let currentId: string | undefined;
   let lastRegistry: any;
+
+  const remove = (id: string) => {
+    live.delete(id);
+    onEnd(id);
+  };
+
+  // pi-subagents can dispose a child without session_shutdown. Its context
+  // then throws, or it reports a different session id after a replacement.
+  const prune = () => {
+    for (const [id, ctx] of live) {
+      if (sessionIdOf(ctx) !== id) remove(id);
+    }
+  };
 
   return {
     /** Store the context of a session event, and make its session current. */
     update(ctx: any): void {
       const registry = read(() => ctx?.modelRegistry);
       if (registry) lastRegistry = registry;
+      prune();
       const id = sessionIdOf(ctx);
       if (!id) return;
       live.delete(id);
       live.set(id, ctx);
-      currentId = id;
     },
 
     /**
-     * Remove the session of an ended context. The most recent live session
-     * becomes current. Returns the id of the ended session.
+     * Remove the session of an ended context, and every stale session. The
+     * most recent live session becomes current. pi makes a new context object
+     * for each event, but it invalidates all contexts of a session together.
+     * So if the ended context is stale, prune() removes its stored context.
      */
-    end(ctx: any): string | undefined {
+    end(ctx: any): void {
       const id = sessionIdOf(ctx);
-      if (!id) return undefined;
-      live.delete(id);
-      if (currentId === id) currentId = [...live.keys()].at(-1);
-      return id;
+      if (id) remove(id);
+      prune();
     },
 
     context(): any {
-      return currentId === undefined ? undefined : live.get(currentId);
+      prune();
+      return [...live.values()].at(-1);
     },
 
     sessionId(): string | undefined {
-      return currentId;
+      prune();
+      return [...live.keys()].at(-1);
     },
 
     hasLiveSessions(): boolean {
+      prune();
       return live.size > 0;
     },
 
